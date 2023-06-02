@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+#
+# This file is part of rg11d
+#
+# rg11d is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# rg11d is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with rg11d.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Weather station daemon"""
+
+import argparse
+import datetime
+import socket
+import threading
+import time
+import Pyro4
+import serial
+from warwick.observatory.common import log
+from warwick.observatory.rg11 import Config
+
+# Set automatically when generating RPM package
+SOFTWARE_VERSION = "UNKNOWN"
+
+
+class RG11MultiplexerDaemon:
+    """Daemon class that wraps the RS232/socket interface"""
+    def __init__(self, config):
+        self._config = config
+        self._lock = threading.Lock()
+        self._latest = None
+
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        """Main run loop"""
+        port_error = False
+        sock = None
+        while True:
+            # Initial setup
+            try:
+                if self._config.socket_ip:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((self._config.socket_ip, self._config.socket_port))
+                    sock.settimeout(self._config.socket_timeout)
+                    port = sock.makefile(mode='rwb')
+                    print(f'Connected to {self._config.socket_ip}:{self._config.socket_port}')
+                else:
+                    port = serial.Serial(self._config.serial_port, self._config.serial_baud,
+                                         timeout=self._config.serial_timeout)
+                    print('Connected to', self._config.serial_port)
+
+                prefix = 'Restored' if port_error else 'Established'
+                log.info(self._config.log_name, prefix + ' connection to RG11 multiplexer')
+                port_error = False
+            except Exception as exception:
+                if not port_error:
+                    print(exception)
+                    print('Will retry in 10 seconds...')
+                    log.error(self._config.log_name, 'Failed to connect to RG11 multiplexer')
+
+                port_error = True
+
+                time.sleep(10.)
+                continue
+
+            try:
+                self._latest = None
+
+                # First line may have been only partially received
+                port.readline()
+
+                # Main run loop
+                while True:
+                    data = port.readline().decode('ascii').strip()
+                    total = len(data)
+                    unsafe = 0
+                    for c in data:
+                        if c != '0':
+                            unsafe += 1
+
+                    latest = {
+                        'date': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'software_version': SOFTWARE_VERSION,
+                        'unsafe_sensors': unsafe,
+                        'total_sensors': total,
+                        'bitfield': data,
+                    }
+
+                    with self._lock:
+                        self._latest = latest
+            except Exception as exception:
+                if sock:
+                    sock.close()
+                    sock = None
+
+                port.close()
+                if not port_error:
+                    print(exception)
+                    print('Will retry in 10 seconds...')
+                    log.error(self._config.log_name, 'Lost connection to RG11 multiplexer')
+                port_error = True
+                time.sleep(10.)
+
+    @Pyro4.expose
+    def last_measurement(self):
+        """Query the latest valid measurement."""
+        with self._lock:
+            return self._latest
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='RG11 multiplexer Server')
+    parser.add_argument('config', help='Path to configuration json file')
+    args = parser.parse_args()
+
+    _config = Config(args.config)
+    _config.daemon.launch(RG11MultiplexerDaemon(_config))

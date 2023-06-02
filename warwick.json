@@ -1,0 +1,7 @@
+{
+  "daemon": "warwick_rain",
+  "log_name": "rg11d@warwick",
+  "socket_ip": "172.19.0.165",
+  "socket_port": 4003,
+  "socket_timeout": 5
+}
